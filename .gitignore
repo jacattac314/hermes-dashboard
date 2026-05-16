@@ -1,3 +1,5 @@
 node_modules/
 dist/
 Hermes.zip
+*.log
+dashboard.err

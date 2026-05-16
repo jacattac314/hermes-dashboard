@@ -113,6 +113,8 @@ app.get('/api/agents', async (_req, res) => {
       description: 'Autonomous coding agent. Dispatched by Symphony against Airtable tasks.',
       command: 'gemini --acp --yolo',
       dispatcher: 'symphony',
+      computePower: 80,
+      computeLabel: 'High',
       ok: gemini.ok,
       version: gemini.version,
     },
@@ -122,6 +124,8 @@ app.get('/api/agents', async (_req, res) => {
       description: 'Planner, reviewer, and code-change authority. Used for final validation.',
       command: 'claude',
       dispatcher: 'manual',
+      computePower: 100,
+      computeLabel: 'Highest',
       ok: claude.ok,
       version: claude.version,
     },
@@ -131,6 +135,8 @@ app.get('/api/agents', async (_req, res) => {
       description: 'Local worker model. Cheap first-pass review, summaries, test ideas.',
       command: 'ask-qwen',
       dispatcher: 'manual',
+      computePower: 35,
+      computeLabel: 'Local worker',
       ok: qwen.ok,
       version: qwen.ok ? qwen.models.join(', ') : null,
       models: qwen.models,
@@ -434,7 +440,23 @@ tr:last-child td { border-bottom: 1px solid var(--border); }
 @keyframes slide-in { from { opacity:0; transform: translateX(20px); } to { opacity:1; transform: none; } }
 
 /* Agents */
-.agents-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+.agents-grid { max-width: 520px; }
+.agents-control {
+  background: var(--card-bg); border: 1px solid rgba(124,106,247,.28); border-radius: 8px;
+  padding: 12px; display: flex; flex-direction: column; gap: 10px;
+}
+.agent-dropdown-row { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; }
+.agent-power-select {
+  width: 100%; min-width: 0; background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px; padding: 7px 9px;
+  font-size: 13px; font-weight: 600; font-family: inherit;
+}
+.agent-power-select:focus { outline: none; border-color: var(--accent); }
+.agent-rank-badge {
+  font-size: 10px; font-weight: 700; color: var(--accent);
+  background: rgba(124,106,247,.15); border-radius: 4px; padding: 4px 7px;
+  text-transform: uppercase; letter-spacing: .04em; white-space: nowrap;
+}
 .agent-card {
   background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 16px;
   display: flex; flex-direction: column; gap: 6px;
@@ -448,6 +470,10 @@ tr:last-child td { border-bottom: 1px solid var(--border); }
 .agent-dot-dead { background: var(--red); }
 .agent-desc { font-size: 12px; color: var(--muted); line-height: 1.45; }
 .agent-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.agent-detail {
+  border-top: 1px solid var(--border); padding-top: 10px;
+  display: flex; flex-direction: column; gap: 6px;
+}
 .agent-tag {
   font-size: 10px; font-weight: 500; background: var(--border); color: var(--muted);
   border-radius: 4px; padding: 2px 7px; font-family: monospace;
@@ -638,11 +664,19 @@ let assignments = "__INITIAL_ASSIGNMENTS__";
 let logLines = [];
 let logsVisible = false;
 let deployDisabled = !"__HAS_AIRTABLE__";
+let availableAgents = [];
+let selectedAvailableAgentId = null;
 
 const AGENTS = [
-  { id: 'hermes', label: 'Hermes', color: '#7c6af7' },
-  { id: 'claude', label: 'Claude', color: '#60a5fa' },
-  { id: 'qwen',   label: 'Qwen',   color: '#34d399' },
+  { id: 'claude', label: 'Claude', color: '#60a5fa', computePower: 100 },
+  { id: 'hermes', label: 'Hermes', color: '#7c6af7', computePower: 80 },
+  { id: 'qwen',   label: 'Qwen',   color: '#34d399', computePower: 35 },
+];
+
+const KANBAN_COLUMNS = [
+  { key: 'todo', title: 'To Do', states: ['todo', 'to do'] },
+  { key: 'in-progress', title: 'In Progress', states: ['in progress', 'in-progress', 'in_progress'] },
+  { key: 'completed', title: 'Completed', states: ['completed', 'complete', 'done'] },
 ];
 
 function fmt(n) {
@@ -741,7 +775,7 @@ function agentForCard(cardId) {
 function agentPicker(cardId) {
   const current = agentForCard(cardId);
   const ag = AGENTS.find(a => a.id === current) || AGENTS[0];
-  const opts = AGENTS.map(a =>
+  const opts = [...AGENTS].sort((a, b) => b.computePower - a.computePower).map(a =>
     \`<option value="\${a.id}"\${a.id === current ? ' selected' : ''}>\${a.label}</option>\`
   ).join('');
   return \`<select class="agent-select" data-card="\${cardId}"
@@ -755,13 +789,20 @@ function renderKanban(s) {
     return;
   }
   const runningIds = new Set((s.running || []).map(r => r.issue_identifier));
-  const html = s.kanban.columns.map(col => {
-    const cards = (col.cards || []).map(card => {
+  const sourceColumns = s.kanban.columns || [];
+  const columns = KANBAN_COLUMNS.map(def => {
+    const cards = sourceColumns
+      .filter(col => def.states.includes(String(col.state || '').trim().toLowerCase()))
+      .flatMap(col => col.cards || []);
+    return { ...def, cards };
+  });
+  const html = columns.map(col => {
+    const cards = col.cards.map(card => {
       const isRunning = card.running || runningIds.has(card.identifier);
       const tableId = tableIdFromUrl(card.tracker_url || card.url);
       const picker = card.id ? agentPicker(card.id) : '';
-      const deployLabel = isRunning ? 'Running' : col.state === 'Todo' ? 'Queued' : 'Deploy';
-      const deployDisabledFlag = isRunning || col.state === 'Todo';
+      const deployLabel = isRunning ? 'Running' : col.key === 'todo' ? 'Queued' : 'Deploy';
+      const deployDisabledFlag = isRunning || col.key === 'todo';
       const deployBtn = card.id
         ? \`<button class="btn-green btn-sm" id="deploy-\${card.id}"
             \${deployDisabledFlag ? 'disabled' : ''}
@@ -781,8 +822,8 @@ function renderKanban(s) {
     }).join('');
     return \`<div class="kanban-col">
       <div class="kanban-col-header">
-        <span class="kanban-col-title">\${esc(col.state)}</span>
-        <span class="kanban-col-count">\${col.cards?.length || 0}</span>
+        <span class="kanban-col-title">\${esc(col.title)}</span>
+        <span class="kanban-col-count">\${col.cards.length}</span>
       </div>
       <div class="kanban-cards">
         \${cards || '<div class="empty-col">Empty</div>'}
@@ -938,31 +979,73 @@ function closeResult() {
   document.getElementById('result-overlay').style.display = 'none';
 }
 
+function sortAgentsByCompute(agents) {
+  return [...agents].sort((a, b) =>
+    (b.computePower || 0) - (a.computePower || 0) || a.name.localeCompare(b.name)
+  );
+}
+
+function agentStatusDot(agent) {
+  return '<span class="agent-dot ' + (agent.ok ? 'agent-dot-ok' : 'agent-dot-dead') + '"></span>';
+}
+
+function selectAvailableAgent(id) {
+  selectedAvailableAgentId = id;
+  renderAgentsDropdown();
+}
+
+function renderAgentsDropdown() {
+  const box = document.getElementById('agents-grid');
+  const agents = sortAgentsByCompute(availableAgents);
+  if (!agents.length) {
+    box.innerHTML = '<span style="color:var(--muted);font-size:13px">No agents found</span>';
+    return;
+  }
+  if (!selectedAvailableAgentId || !agents.some(a => a.id === selectedAvailableAgentId)) {
+    selectedAvailableAgentId = agents[0].id;
+  }
+  const selected = agents.find(a => a.id === selectedAvailableAgentId) || agents[0];
+  const options = agents.map((a, index) => {
+    const status = a.ok ? 'online' : 'offline';
+    const power = a.computeLabel || ('Power ' + (a.computePower || 0));
+    return \`<option value="\${a.id}"\${a.id === selected.id ? ' selected' : ''}>
+      #\${index + 1} · \${esc(a.name)} · \${esc(power)} · \${status}
+    </option>\`;
+  }).join('');
+  const dispatcherTag = selected.dispatcher === 'symphony'
+    ? '<span class="agent-tag agent-tag-symphony">symphony</span>'
+    : '<span class="agent-tag">manual</span>';
+  const versionTag = selected.version
+    ? '<span class="agent-tag">' + esc(selected.version.slice(0, 72)) + '</span>'
+    : '';
+  const selectedRank = agents.findIndex(a => a.id === selected.id) + 1;
+  box.innerHTML = \`<div class="agents-control">
+    <div class="agent-dropdown-row">
+      <select class="agent-power-select" aria-label="Available agents ranked by compute power"
+        onchange="selectAvailableAgent(this.value)">\${options}</select>
+      <span class="agent-rank-badge">Rank #\${selectedRank}</span>
+    </div>
+    <div class="agent-detail">
+      <div class="agent-card-top">
+        <span class="agent-name">\${esc(selected.name)}</span>
+        \${agentStatusDot(selected)}
+      </div>
+      <div class="agent-desc">\${esc(selected.description)}</div>
+      <div class="agent-meta">
+        <span class="agent-tag">\${esc(selected.command)}</span>
+        <span class="agent-tag">compute \${esc(selected.computeLabel || selected.computePower || '—')}</span>
+        \${dispatcherTag}
+        \${versionTag}
+      </div>
+    </div>
+  </div>\`;
+}
+
 async function loadAgents() {
   try {
     const r = await fetch('/api/agents');
-    const agents = await r.json();
-    const grid = document.getElementById('agents-grid');
-    grid.innerHTML = agents.map(a => {
-      const dispatcherTag = a.dispatcher === 'symphony'
-        ? '<span class="agent-tag agent-tag-symphony">symphony</span>'
-        : '<span class="agent-tag">manual</span>';
-      const versionTag = a.version
-        ? '<span class="agent-tag">' + esc(a.version.slice(0, 48)) + '</span>'
-        : '';
-      return \`<div class="agent-card \${a.ok ? 'agent-ok' : 'agent-dead'}">
-        <div class="agent-card-top">
-          <span class="agent-name">\${esc(a.name)}</span>
-          <span class="agent-dot \${a.ok ? 'agent-dot-ok' : 'agent-dot-dead'}"></span>
-        </div>
-        <div class="agent-desc">\${esc(a.description)}</div>
-        <div class="agent-meta">
-          <span class="agent-tag">\${esc(a.command)}</span>
-          \${dispatcherTag}
-          \${versionTag}
-        </div>
-      </div>\`;
-    }).join('');
+    availableAgents = await r.json();
+    renderAgentsDropdown();
   } catch (e) {
     document.getElementById('agents-grid').innerHTML =
       '<span style="color:var(--muted);font-size:13px">Could not load agents</span>';
