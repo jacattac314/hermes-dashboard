@@ -13,6 +13,14 @@ const LOGS_PATH = path.join(
   process.env.HOME,
   'Library/Application Support/JustJackSymphony/log/log/symphony.log.1'
 );
+const ASSIGNMENTS_PATH = path.join(process.env.HOME, '.hermes-assignments.json');
+
+function readAssignments() {
+  try { return JSON.parse(fs.readFileSync(ASSIGNMENTS_PATH, 'utf8')); } catch { return {}; }
+}
+function writeAssignments(data) {
+  fs.writeFileSync(ASSIGNMENTS_PATH, JSON.stringify(data, null, 2));
+}
 
 // ── API routes ────────────────────────────────────────────────────────────────
 
@@ -158,6 +166,76 @@ app.post('/api/create', async (req, res) => {
   }
 });
 
+app.get('/api/assignments', (_req, res) => res.json(readAssignments()));
+
+app.post('/api/assign', (req, res) => {
+  const { recordId, agent } = req.body;
+  if (!recordId || !agent) return res.status(400).json({ error: 'recordId and agent required' });
+  const data = readAssignments();
+  data[recordId] = agent;
+  writeAssignments(data);
+  res.json({ ok: true });
+});
+
+// Deploy with agent routing
+app.post('/api/deploy-agent', async (req, res) => {
+  const { recordId, tableId, agent, title, description } = req.body;
+  if (!recordId || !agent) return res.status(400).json({ error: 'recordId and agent required' });
+
+  if (agent === 'hermes') {
+    // Symphony flow: set Airtable → Todo then refresh
+    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID || !tableId) {
+      return res.status(503).json({ error: 'Airtable creds or tableId missing' });
+    }
+    try {
+      const r = await fetch(
+        `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${tableId}/${recordId}`,
+        {
+          method: 'PATCH',
+          headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ fields: { Status: 'Todo' } }),
+        }
+      );
+      const data = await r.json();
+      if (!r.ok) return res.status(r.status).json(data);
+      await fetch(`${SYMPHONY}/api/v1/refresh`, { method: 'POST' }).catch(() => {});
+      return res.json({ ok: true, action: 'dispatched', agent: 'hermes' });
+    } catch (e) {
+      return res.status(500).json({ error: e.message });
+    }
+  }
+
+  if (agent === 'claude') {
+    const prompt = [title, description].filter(Boolean).join('\n\n');
+    const command = `claude ${JSON.stringify(prompt)}`;
+    return res.json({ ok: true, action: 'terminal', agent: 'claude', command });
+  }
+
+  if (agent === 'qwen') {
+    const prompt = [title, description].filter(Boolean).join('\n\n');
+    try {
+      const r = await fetch('http://localhost:1234/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'qwen-local',
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: 1024,
+        }),
+        signal: AbortSignal.timeout(30000),
+      });
+      if (!r.ok) return res.status(r.status).json({ error: 'Qwen API error' });
+      const data = await r.json();
+      const reply = data.choices?.[0]?.message?.content || '(no response)';
+      return res.json({ ok: true, action: 'response', agent: 'qwen', reply });
+    } catch (e) {
+      return res.status(503).json({ error: `Qwen unreachable: ${e.message}` });
+    }
+  }
+
+  res.status(400).json({ error: `Unknown agent: ${agent}` });
+});
+
 app.get('/api/logs', (_req, res) => {
   try {
     if (!fs.existsSync(LOGS_PATH)) return res.json({ lines: [], path: LOGS_PATH });
@@ -179,9 +257,11 @@ app.get('/', async (_req, res) => {
     initialState = await r.json();
   } catch (_) {}
   const hasAirtable = !!(AIRTABLE_API_KEY && AIRTABLE_BASE_ID);
+  const assignments = readAssignments();
   const hydrated = HTML
     .replace('"__INITIAL_STATE__"', JSON.stringify(initialState))
-    .replace('"__HAS_AIRTABLE__"', JSON.stringify(hasAirtable));
+    .replace('"__HAS_AIRTABLE__"', JSON.stringify(hasAirtable))
+    .replace('"__INITIAL_ASSIGNMENTS__"', JSON.stringify(assignments));
   res.send(hydrated);
 });
 
@@ -374,6 +454,35 @@ tr:last-child td { border-bottom: 1px solid var(--border); }
 }
 .agent-tag-symphony { background: rgba(124,106,247,.15); color: var(--accent); }
 
+/* Agent select on cards */
+.agent-select {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+  font-size: 11px; font-weight: 600; padding: 3px 6px; cursor: pointer;
+  font-family: inherit; transition: border-color .15s, color .15s;
+}
+.agent-select:focus { outline: none; }
+
+/* Result panel */
+#result-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.65); z-index: 100;
+  display: flex; align-items: center; justify-content: center;
+}
+#result-panel {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  padding: 28px; width: 560px; max-width: calc(100vw - 32px); max-height: 80vh;
+  overflow-y: auto; box-shadow: 0 20px 60px rgba(0,0,0,.5);
+}
+.result-cmd {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  padding: 12px; font-family: 'SF Mono', monospace; font-size: 12px;
+  word-break: break-all; white-space: pre-wrap; color: var(--accent);
+}
+.result-reply {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  padding: 14px; font-size: 13px; line-height: 1.6; white-space: pre-wrap;
+  max-height: 400px; overflow-y: auto;
+}
+
 /* Modal */
 #modal-overlay {
   position: fixed; inset: 0; background: rgba(0,0,0,.65); z-index: 100;
@@ -472,6 +581,17 @@ a:hover { text-decoration: underline; }
 
 <div id="toasts"></div>
 
+<!-- Agent result panel -->
+<div id="result-overlay" style="display:none" onclick="if(event.target===this)closeResult()">
+  <div id="result-panel">
+    <div class="modal-header">
+      <h2 class="modal-title" id="result-title"></h2>
+      <button class="modal-close" onclick="closeResult()">✕</button>
+    </div>
+    <div id="result-body"></div>
+  </div>
+</div>
+
 <!-- New task modal -->
 <div id="modal-overlay" style="display:none" onclick="if(event.target===this)closeNewTask()">
   <div id="modal">
@@ -514,9 +634,16 @@ a:hover { text-decoration: underline; }
 
 <script>
 let state = "__INITIAL_STATE__";
+let assignments = "__INITIAL_ASSIGNMENTS__";
 let logLines = [];
 let logsVisible = false;
 let deployDisabled = !"__HAS_AIRTABLE__";
+
+const AGENTS = [
+  { id: 'hermes', label: 'Hermes', color: '#7c6af7' },
+  { id: 'claude', label: 'Claude', color: '#60a5fa' },
+  { id: 'qwen',   label: 'Qwen',   color: '#34d399' },
+];
 
 function fmt(n) {
   if (n == null) return 'n/a';
@@ -607,6 +734,21 @@ function renderMetrics(s) {
     '<span class="metric" style="color:var(--muted);font-size:11px">updated ' + new Date().toLocaleTimeString() + '</span>';
 }
 
+function agentForCard(cardId) {
+  return assignments[cardId] || 'hermes';
+}
+
+function agentPicker(cardId) {
+  const current = agentForCard(cardId);
+  const ag = AGENTS.find(a => a.id === current) || AGENTS[0];
+  const opts = AGENTS.map(a =>
+    \`<option value="\${a.id}"\${a.id === current ? ' selected' : ''}>\${a.label}</option>\`
+  ).join('');
+  return \`<select class="agent-select" data-card="\${cardId}"
+    style="border-color:\${ag.color}33;color:\${ag.color}"
+    onchange="assignAgent('\${cardId}', this.value)">\${opts}</select>\`;
+}
+
 function renderKanban(s) {
   if (!s?.kanban?.columns) {
     document.getElementById('kanban').innerHTML = '<span style="color:var(--muted);font-size:13px">No kanban data</span>';
@@ -617,22 +759,22 @@ function renderKanban(s) {
     const cards = (col.cards || []).map(card => {
       const isRunning = card.running || runningIds.has(card.identifier);
       const tableId = tableIdFromUrl(card.tracker_url || card.url);
-      const canDeploy = !deployDisabled && card.id && tableId;
-      const isTerminal = ['completed','done','canceled','cancelled','duplicate','featured'].includes(col.state.toLowerCase());
-      const deployBtn = (isRunning || col.state === 'Todo')
-        ? ''
-        : canDeploy
-          ? \`<button class="btn-green btn-sm" id="deploy-\${card.id}" onclick="deploy('\${card.id}','\${tableId}',\${JSON.stringify(card.title)})">Deploy</button>\`
-          : !deployDisabled
-            ? '<span class="link-muted" title="Record ID or table ID unavailable">Deploy</span>'
-            : '<span class="link-muted" title="Airtable creds not set on server">Deploy disabled</span>';
+      const picker = card.id ? agentPicker(card.id) : '';
+      const deployLabel = isRunning ? 'Running' : col.state === 'Todo' ? 'Queued' : 'Deploy';
+      const deployDisabledFlag = isRunning || col.state === 'Todo';
+      const deployBtn = card.id
+        ? \`<button class="btn-green btn-sm" id="deploy-\${card.id}"
+            \${deployDisabledFlag ? 'disabled' : ''}
+            onclick="deployAgent('\${card.id}','\${tableId || ''}',\${JSON.stringify(card.title)},\${JSON.stringify(card.description || '')})">
+            \${deployLabel}</button>\`
+        : '';
       return \`<article class="kanban-card\${isRunning ? ' is-running' : ''}\${card.retrying ? ' is-retrying' : ''}">
         <div class="card-title">\${esc(card.title || '(untitled)')}</div>
         \${card.description ? '<div class="card-desc">' + esc(card.description) + '</div>' : ''}
         <div class="card-actions">
           \${card.tracker_url ? '<a href="' + card.tracker_url + '" target="_blank" class="btn-ghost btn-sm">Tracker ↗</a>' : ''}
+          \${picker}
           \${deployBtn}
-          \${isRunning ? '<span class="pill pill-live">Running</span>' : ''}
           \${card.retrying ? '<span class="pill pill-retry">Retrying</span>' : ''}
         </div>
       </article>\`;
@@ -675,8 +817,9 @@ function esc(s) {
 
 async function loadState() {
   try {
-    const r = await fetch('/api/state');
-    state = await r.json();
+    const [sr, ar] = await Promise.all([fetch('/api/state'), fetch('/api/assignments')]);
+    state = await sr.json();
+    assignments = await ar.json();
   } catch { state = { error: 'Fetch failed' }; }
   renderMetrics(state);
   renderKanban(state);
@@ -724,6 +867,77 @@ async function checkDeployCapability() {
   // show deploy buttons and let the error toast explain if creds are missing.
 }
 
+async function assignAgent(cardId, agent) {
+  assignments[cardId] = agent;
+  // Update picker color live
+  const sel = document.querySelector(\`select[data-card="\${cardId}"]\`);
+  if (sel) {
+    const ag = AGENTS.find(a => a.id === agent) || AGENTS[0];
+    sel.style.borderColor = ag.color + '33';
+    sel.style.color = ag.color;
+  }
+  await fetch('/api/assign', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ recordId: cardId, agent }),
+  }).catch(() => {});
+}
+
+async function deployAgent(recordId, tableId, title, description) {
+  const agent = agentForCard(recordId);
+  const btn = document.getElementById('deploy-' + recordId);
+  if (btn) { btn.disabled = true; btn.textContent = 'Deploying…'; }
+
+  try {
+    const r = await fetch('/api/deploy-agent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ recordId, tableId, agent, title, description }),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      toast(data.error || 'Deploy failed', 'err');
+      if (btn) { btn.disabled = false; btn.textContent = 'Deploy'; }
+      return;
+    }
+    if (data.action === 'dispatched') {
+      toast('Hermes dispatched via Symphony');
+      setTimeout(loadState, 1500);
+    } else if (data.action === 'terminal') {
+      showCommandPanel(title, data.command, 'Claude Code');
+      if (btn) { btn.disabled = false; btn.textContent = 'Deploy'; }
+    } else if (data.action === 'response') {
+      showResponsePanel(title, data.reply, 'Qwen');
+      if (btn) { btn.disabled = false; btn.textContent = 'Deploy'; }
+    }
+  } catch (e) {
+    toast('Error: ' + e.message, 'err');
+    if (btn) { btn.disabled = false; btn.textContent = 'Deploy'; }
+  }
+}
+
+function showCommandPanel(title, command, agentLabel) {
+  document.getElementById('result-title').textContent = agentLabel + ' — ' + title;
+  document.getElementById('result-body').innerHTML =
+    '<p style="font-size:12px;color:var(--muted);margin-bottom:10px">Run this command in a terminal to start the agent on this task:</p>' +
+    '<div class="result-cmd" id="result-cmd">' + esc(command) + '</div>' +
+    '<button class="btn-ghost btn-sm" style="margin-top:10px" onclick="copyCmd()">Copy command</button>';
+  document.getElementById('result-overlay').style.display = 'flex';
+}
+function copyCmd() {
+  const t = document.getElementById('result-cmd')?.textContent;
+  if (t) navigator.clipboard.writeText(t).then(() => toast('Copied to clipboard'));
+}
+function showResponsePanel(title, reply, agentLabel) {
+  document.getElementById('result-title').textContent = agentLabel + ' — ' + title;
+  document.getElementById('result-body').innerHTML =
+    '<div class="result-reply">' + esc(reply) + '</div>';
+  document.getElementById('result-overlay').style.display = 'flex';
+}
+function closeResult() {
+  document.getElementById('result-overlay').style.display = 'none';
+}
+
 async function loadAgents() {
   try {
     const r = await fetch('/api/agents');
@@ -765,7 +979,9 @@ function closeNewTask() {
   document.getElementById('nt-submit').disabled = false;
   document.getElementById('nt-submit').textContent = 'Deploy agent';
 }
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeNewTask(); });
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { closeNewTask(); closeResult(); }
+});
 
 async function submitNewTask(e) {
   e.preventDefault();
