@@ -66,6 +66,70 @@ app.post('/api/deploy', async (req, res) => {
   }
 });
 
+// Agent health checks
+app.get('/api/agents', async (_req, res) => {
+  const { execFile } = require('child_process');
+  const util = require('util');
+  const execP = util.promisify(execFile);
+
+  async function checkCLI(cmd, args) {
+    try {
+      const { stdout } = await execP(cmd, args, { timeout: 4000 });
+      return { ok: true, version: stdout.trim().split('\n')[0] };
+    } catch {
+      return { ok: false, version: null };
+    }
+  }
+
+  async function checkQwen() {
+    try {
+      const r = await fetch('http://localhost:1234/v1/models', { signal: AbortSignal.timeout(3000) });
+      if (!r.ok) return { ok: false, models: [] };
+      const { data } = await r.json();
+      return { ok: true, models: (data || []).map(m => m.id).filter(id => !id.includes('embed')) };
+    } catch {
+      return { ok: false, models: [] };
+    }
+  }
+
+  const [gemini, claude, qwen] = await Promise.all([
+    checkCLI('gemini', ['--version']),
+    checkCLI('claude', ['--version']),
+    checkQwen(),
+  ]);
+
+  res.json([
+    {
+      id: 'gemini',
+      name: 'Hermes / Gemini CLI',
+      description: 'Autonomous coding agent. Dispatched by Symphony against Airtable tasks.',
+      command: 'gemini --acp --yolo',
+      dispatcher: 'symphony',
+      ok: gemini.ok,
+      version: gemini.version,
+    },
+    {
+      id: 'claude',
+      name: 'Claude Code',
+      description: 'Planner, reviewer, and code-change authority. Used for final validation.',
+      command: 'claude',
+      dispatcher: 'manual',
+      ok: claude.ok,
+      version: claude.version,
+    },
+    {
+      id: 'qwen',
+      name: 'Qwen (LM Studio)',
+      description: 'Local worker model. Cheap first-pass review, summaries, test ideas.',
+      command: 'ask-qwen',
+      dispatcher: 'manual',
+      ok: qwen.ok,
+      version: qwen.ok ? qwen.models.join(', ') : null,
+      models: qwen.models,
+    },
+  ]);
+});
+
 // Create a new Airtable task and immediately set it to Todo
 app.post('/api/create', async (req, res) => {
   const { name, description, priority, url } = req.body;
@@ -289,6 +353,27 @@ tr:last-child td { border-bottom: 1px solid var(--border); }
 .toast.err { border-color: rgba(248,113,113,.4); color: var(--red); }
 @keyframes slide-in { from { opacity:0; transform: translateX(20px); } to { opacity:1; transform: none; } }
 
+/* Agents */
+.agents-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+.agent-card {
+  background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 16px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.agent-card.agent-ok { border-color: rgba(52,211,153,.25); }
+.agent-card.agent-dead { border-color: rgba(248,113,113,.2); opacity: .7; }
+.agent-card-top { display: flex; align-items: center; justify-content: space-between; }
+.agent-name { font-size: 13px; font-weight: 600; }
+.agent-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.agent-dot-ok { background: var(--green); }
+.agent-dot-dead { background: var(--red); }
+.agent-desc { font-size: 12px; color: var(--muted); line-height: 1.45; }
+.agent-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.agent-tag {
+  font-size: 10px; font-weight: 500; background: var(--border); color: var(--muted);
+  border-radius: 4px; padding: 2px 7px; font-family: monospace;
+}
+.agent-tag-symphony { background: rgba(124,106,247,.15); color: var(--accent); }
+
 /* Modal */
 #modal-overlay {
   position: fixed; inset: 0; background: rgba(0,0,0,.65); z-index: 100;
@@ -341,6 +426,13 @@ a:hover { text-decoration: underline; }
       <button class="btn-accent" onclick="openNewTask()">+ New task</button>
     </div>
   </header>
+
+  <div class="section" id="section-agents">
+    <div class="section-label">Available agents</div>
+    <div class="agents-grid" id="agents-grid">
+      <div style="color:var(--muted);font-size:13px">Checking…</div>
+    </div>
+  </div>
 
   <div class="section" id="section-kanban">
     <div class="section-label">Kanban</div>
@@ -632,6 +724,37 @@ async function checkDeployCapability() {
   // show deploy buttons and let the error toast explain if creds are missing.
 }
 
+async function loadAgents() {
+  try {
+    const r = await fetch('/api/agents');
+    const agents = await r.json();
+    const grid = document.getElementById('agents-grid');
+    grid.innerHTML = agents.map(a => {
+      const dispatcherTag = a.dispatcher === 'symphony'
+        ? '<span class="agent-tag agent-tag-symphony">symphony</span>'
+        : '<span class="agent-tag">manual</span>';
+      const versionTag = a.version
+        ? '<span class="agent-tag">' + esc(a.version.slice(0, 48)) + '</span>'
+        : '';
+      return \`<div class="agent-card \${a.ok ? 'agent-ok' : 'agent-dead'}">
+        <div class="agent-card-top">
+          <span class="agent-name">\${esc(a.name)}</span>
+          <span class="agent-dot \${a.ok ? 'agent-dot-ok' : 'agent-dot-dead'}"></span>
+        </div>
+        <div class="agent-desc">\${esc(a.description)}</div>
+        <div class="agent-meta">
+          <span class="agent-tag">\${esc(a.command)}</span>
+          \${dispatcherTag}
+          \${versionTag}
+        </div>
+      </div>\`;
+    }).join('');
+  } catch (e) {
+    document.getElementById('agents-grid').innerHTML =
+      '<span style="color:var(--muted);font-size:13px">Could not load agents</span>';
+  }
+}
+
 function openNewTask() {
   document.getElementById('modal-overlay').style.display = 'flex';
   document.getElementById('nt-name').focus();
@@ -682,6 +805,8 @@ async function submitNewTask(e) {
 if (state) { renderMetrics(state); renderKanban(state); renderRunning(state); }
 else loadState();
 setInterval(loadState, 5000);
+loadAgents();
+setInterval(loadAgents, 30000);
 </script>
 </body>
 </html>`;
