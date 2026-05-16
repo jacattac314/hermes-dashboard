@@ -1,0 +1,14 @@
+{
+  "name": "hermes-dashboard",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "puppeteer": "^25.0.2"
+  }
+}
