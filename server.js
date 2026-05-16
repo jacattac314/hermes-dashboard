@@ -361,11 +361,48 @@ button:not(:disabled):hover { opacity: .8; }
 .kanban-cards { display: flex; flex-direction: column; gap: 8px; }
 .kanban-card {
   background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px;
-  padding: 12px; transition: border-color .15s;
+  padding: 12px; position: relative; transition: border-color .15s, box-shadow .15s;
 }
 .kanban-card:hover { border-color: #3a3c40; }
 .kanban-card.is-running { border-color: rgba(124,106,247,.5); }
 .kanban-card.is-retrying { border-color: rgba(251,191,36,.4); }
+.kanban-card.is-active-work {
+  border-color: rgba(124,106,247,.85);
+  outline: 1px solid rgba(96,165,250,.22);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 1px rgba(124,106,247,.18), 0 0 16px rgba(124,106,247,.16);
+  animation: active-work-outline 1.9s ease-in-out infinite;
+}
+.kanban-card.is-active-work::after {
+  content: '';
+  position: absolute;
+  inset: -4px;
+  border: 1px solid rgba(96,165,250,.18);
+  border-radius: 11px;
+  pointer-events: none;
+  animation: active-work-halo 1.9s ease-in-out infinite;
+}
+.kanban-card.is-active-work:hover { border-color: rgba(124,106,247,.95); }
+@keyframes active-work-outline {
+  0%, 100% {
+    outline-color: rgba(96,165,250,.18);
+    box-shadow: 0 0 0 1px rgba(124,106,247,.16), 0 0 12px rgba(124,106,247,.12);
+  }
+  50% {
+    outline-color: rgba(96,165,250,.46);
+    box-shadow: 0 0 0 1px rgba(124,106,247,.34), 0 0 24px rgba(124,106,247,.28);
+  }
+}
+@keyframes active-work-halo {
+  0%, 100% { opacity: .42; transform: scale(1); }
+  50% { opacity: .95; transform: scale(1.012); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .kanban-card.is-active-work,
+  .kanban-card.is-active-work::after {
+    animation: none;
+  }
+}
 .card-title { font-size: 13px; font-weight: 500; line-height: 1.35; margin-bottom: 6px; }
 .card-desc {
   font-size: 12px; color: var(--muted); line-height: 1.45; margin-bottom: 8px;
@@ -799,6 +836,13 @@ function renderKanban(s) {
   const html = columns.map(col => {
     const cards = col.cards.map(card => {
       const isRunning = card.running || runningIds.has(card.identifier);
+      const isActiveWork = isRunning || col.key === 'in-progress';
+      const cardClasses = [
+        'kanban-card',
+        isActiveWork ? 'is-active-work' : '',
+        isRunning ? 'is-running' : '',
+        card.retrying ? 'is-retrying' : '',
+      ].filter(Boolean).join(' ');
       const tableId = tableIdFromUrl(card.tracker_url || card.url);
       const picker = card.id ? agentPicker(card.id) : '';
       const deployLabel = isRunning ? 'Running' : col.key === 'todo' ? 'Queued' : 'Deploy';
@@ -809,7 +853,7 @@ function renderKanban(s) {
             onclick="deployAgent('\${card.id}','\${tableId || ''}',\${JSON.stringify(card.title)},\${JSON.stringify(card.description || '')})">
             \${deployLabel}</button>\`
         : '';
-      return \`<article class="kanban-card\${isRunning ? ' is-running' : ''}\${card.retrying ? ' is-retrying' : ''}">
+      return \`<article class="\${cardClasses}" data-active-work="\${isActiveWork ? 'true' : 'false'}">
         <div class="card-title">\${esc(card.title || '(untitled)')}</div>
         \${card.description ? '<div class="card-desc">' + esc(card.description) + '</div>' : ''}
         <div class="card-actions">
