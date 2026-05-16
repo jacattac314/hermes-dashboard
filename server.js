@@ -66,6 +66,34 @@ app.post('/api/deploy', async (req, res) => {
   }
 });
 
+// Create a new Airtable task and immediately set it to Todo
+app.post('/api/create', async (req, res) => {
+  const { name, description, priority, url } = req.body;
+  if (!name) return res.status(400).json({ error: 'name required' });
+  if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
+    return res.status(503).json({ error: 'AIRTABLE_API_KEY and AIRTABLE_BASE_ID env vars not set' });
+  }
+  const { AIRTABLE_TABLE } = process.env;
+  if (!AIRTABLE_TABLE) return res.status(503).json({ error: 'AIRTABLE_TABLE env var not set' });
+  const fields = { 'Project Name': name, Status: 'Todo' };
+  if (description) fields['Description'] = description;
+  if (priority) fields['Priority'] = priority;
+  if (url) fields['Project URL'] = url;
+  try {
+    const r = await fetch(`https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_TABLE}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fields }),
+    });
+    const data = await r.json();
+    if (!r.ok) return res.status(r.status).json(data);
+    await fetch(`${SYMPHONY}/api/v1/refresh`, { method: 'POST' }).catch(() => {});
+    res.json({ ok: true, id: data.id });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/logs', (_req, res) => {
   try {
     if (!fs.existsSync(LOGS_PATH)) return res.json({ lines: [], path: LOGS_PATH });
@@ -261,6 +289,34 @@ tr:last-child td { border-bottom: 1px solid var(--border); }
 .toast.err { border-color: rgba(248,113,113,.4); color: var(--red); }
 @keyframes slide-in { from { opacity:0; transform: translateX(20px); } to { opacity:1; transform: none; } }
 
+/* Modal */
+#modal-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.65); z-index: 100;
+  display: flex; align-items: center; justify-content: center;
+}
+#modal {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  padding: 28px; width: 520px; max-width: calc(100vw - 32px); max-height: 90vh;
+  overflow-y: auto; box-shadow: 0 20px 60px rgba(0,0,0,.5);
+}
+.modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.modal-title { font-size: 16px; font-weight: 700; }
+.modal-close { background: none; border: none; color: var(--muted); font-size: 16px; cursor: pointer; padding: 2px 6px; }
+.modal-close:hover { color: var(--text); }
+.modal-sub { font-size: 12px; color: var(--muted); margin-bottom: 20px; }
+.field-label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin-bottom: 5px; }
+.req { color: var(--accent); }
+.field-input {
+  display: block; width: 100%; background: var(--bg); border: 1px solid var(--border);
+  color: var(--text); border-radius: 6px; padding: 7px 10px; font-size: 13px;
+  font-family: inherit;
+}
+.field-input:focus { outline: none; border-color: var(--accent); }
+.field-textarea { resize: vertical; min-height: 100px; }
+.field-row { display: flex; gap: 12px; margin-top: 14px; }
+select.field-input { cursor: pointer; }
+.modal-footer { display: flex; justify-content: flex-end; gap: 10px; margin-top: 22px; }
+
 /* Misc */
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
@@ -282,6 +338,7 @@ a:hover { text-decoration: underline; }
       <div class="pulse" id="pulse"></div>
       <button class="btn-ghost" id="btn-refresh" onclick="triggerRefresh()">↻ Force poll</button>
       <button class="btn-ghost" id="btn-logs-toggle" onclick="toggleLogs()">Logs</button>
+      <button class="btn-accent" onclick="openNewTask()">+ New task</button>
     </div>
   </header>
 
@@ -322,6 +379,46 @@ a:hover { text-decoration: underline; }
 </div>
 
 <div id="toasts"></div>
+
+<!-- New task modal -->
+<div id="modal-overlay" style="display:none" onclick="if(event.target===this)closeNewTask()">
+  <div id="modal">
+    <div class="modal-header">
+      <h2 class="modal-title">New task</h2>
+      <button class="modal-close" onclick="closeNewTask()">✕</button>
+    </div>
+    <p class="modal-sub">Creates an Airtable record with Status&nbsp;→&nbsp;Todo and triggers Symphony to pick it up.</p>
+    <form id="new-task-form" onsubmit="submitNewTask(event)">
+      <label class="field-label">Task name <span class="req">*</span></label>
+      <input class="field-input" id="nt-name" type="text" placeholder="e.g. Refactor auth module" required autocomplete="off">
+
+      <label class="field-label" style="margin-top:14px">Description</label>
+      <textarea class="field-input field-textarea" id="nt-desc" placeholder="What should Hermes do? Acceptance criteria, context, links…" rows="5"></textarea>
+
+      <div class="field-row">
+        <div style="flex:1">
+          <label class="field-label">Priority</label>
+          <select class="field-input" id="nt-priority">
+            <option value="">—</option>
+            <option value="1">1 — Urgent</option>
+            <option value="2">2 — High</option>
+            <option value="3">3 — Medium</option>
+            <option value="4">4 — Low</option>
+          </select>
+        </div>
+        <div style="flex:2">
+          <label class="field-label">Project URL</label>
+          <input class="field-input" id="nt-url" type="url" placeholder="https://github.com/…">
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <button type="button" class="btn-ghost" onclick="closeNewTask()">Cancel</button>
+        <button type="submit" class="btn-accent" id="nt-submit">Deploy agent</button>
+      </div>
+    </form>
+  </div>
+</div>
 
 <script>
 let state = "__INITIAL_STATE__";
@@ -533,6 +630,52 @@ function toggleLogs(forceOpen) {
 async function checkDeployCapability() {
   // We infer from env: if state loaded ok, try a quick test; simpler to just
   // show deploy buttons and let the error toast explain if creds are missing.
+}
+
+function openNewTask() {
+  document.getElementById('modal-overlay').style.display = 'flex';
+  document.getElementById('nt-name').focus();
+}
+function closeNewTask() {
+  document.getElementById('modal-overlay').style.display = 'none';
+  document.getElementById('new-task-form').reset();
+  document.getElementById('nt-submit').disabled = false;
+  document.getElementById('nt-submit').textContent = 'Deploy agent';
+}
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeNewTask(); });
+
+async function submitNewTask(e) {
+  e.preventDefault();
+  const btn = document.getElementById('nt-submit');
+  btn.disabled = true;
+  btn.textContent = 'Creating…';
+  const body = {
+    name: document.getElementById('nt-name').value.trim(),
+    description: document.getElementById('nt-desc').value.trim() || undefined,
+    priority: document.getElementById('nt-priority').value || undefined,
+    url: document.getElementById('nt-url').value.trim() || undefined,
+  };
+  try {
+    const r = await fetch('/api/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await r.json();
+    if (r.ok) {
+      toast('Task created — agent queued');
+      closeNewTask();
+      setTimeout(loadState, 1500);
+    } else {
+      toast(data.error || 'Create failed', 'err');
+      btn.disabled = false;
+      btn.textContent = 'Deploy agent';
+    }
+  } catch (err) {
+    toast('Error: ' + err.message, 'err');
+    btn.disabled = false;
+    btn.textContent = 'Deploy agent';
+  }
 }
 
 // Boot — render SSR state immediately, then start polling for live updates
